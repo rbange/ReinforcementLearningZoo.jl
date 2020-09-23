@@ -916,6 +916,100 @@ end
 
 function RLCore.Experiment(
     ::Val{:JuliaRL},
+    ::Val{:NAF},
+    ::Val{:Pendulum},
+    ::Nothing;
+    save_dir = nothing,
+    seed = 123,
+)
+    if isnothing(save_dir)
+        t = Dates.format(now(), "yyyy_mm_dd_HH_MM_SS")
+        save_dir = joinpath(pwd(), "checkpoints", "JuliaRL_NAF_Pendulum_$(t)")
+    end
+
+    lg = TBLogger(joinpath(save_dir, "tb_log"), min_level = Logging.Info)
+    rng = MersenneTwister(seed)
+    inner_env = PendulumEnv(T = Float32, rng = rng)
+    action_space = get_actions(inner_env)
+    low = action_space.low
+    high = action_space.high
+    ns = length(get_state(inner_env))
+
+    env = inner_env |> ActionTransformedEnv(x -> low + (x + 1) * 0.5 * (high - low))
+    w_init(x...) = Flux.kaiming_normal(rng, x, gain = 0.001) # create init weights close to zero
+
+    create_q() = NAFNetwork(
+        Chain(Dense(ns, 30, relu), Dense(30, 30, relu)),
+        Dense(30, 1, tanh, initW = w_init), # μ
+        Dense(30, 1, initW = w_init), # V
+        Dense(30, 1, tanh, initW = w_init), # L / tanh activation to avoid gradient explosion
+    )
+
+    agent = Agent(
+        policy = NAFPolicy(
+            q = NeuralNetworkApproximator(
+                model = create_q(),
+                optimizer = ADAM(5f-3),
+            ),
+            q_target = NeuralNetworkApproximator(
+                model = create_q(),
+                optimizer = ADAM(),
+            ),
+            γ = 0.99f0,
+            ρ = 0.995f0,
+            batch_size = 128,
+            start_steps = 1000,
+            start_policy = RandomPolicy(ContinuousSpace(-1.0, 1.0); rng = rng),
+            update_after = 1000,
+            update_every = 1,
+            act_limit = 1.0,
+            act_noise = 0.5,
+            rng = rng,
+        ),
+        trajectory = CircularCompactSARTSATrajectory(
+            capacity = 10_000,
+            state_type = Float32,
+            state_size = (ns,),
+            action_type = Float32,
+        ),
+    )
+
+    stop_condition = StopAfterStep(10_000)
+    total_reward_per_episode = TotalRewardPerEpisode()
+    time_per_step = TimePerStep()
+    hook = ComposedHook(
+        total_reward_per_episode,
+        time_per_step,
+        DoEveryNStep() do t, agent, env
+            with_logger(lg) do
+                @info(
+                    "training",
+                    loss = agent.policy.loss,
+                )
+            end
+        end,
+        DoEveryNEpisode() do t, agent, env
+            with_logger(lg) do
+                @info "training" reward = total_reward_per_episode.rewards[end] log_step_increment = 0
+            end
+        end,
+        DoEveryNStep(10_000) do t, agent, env
+            RLCore.save(save_dir, agent)
+            BSON.@save joinpath(save_dir, "stats.bson") total_reward_per_episode time_per_step
+        end,
+    )
+
+    Experiment(
+        agent,
+        env,
+        stop_condition,
+        hook,
+        Description("# Play Pendulum with NAF", save_dir),
+    )
+end
+
+function RLCore.Experiment(
+    ::Val{:JuliaRL},
     ::Val{:PPO},
     ::Val{:CartPole},
     ::Nothing;
